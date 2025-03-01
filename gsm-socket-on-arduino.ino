@@ -94,14 +94,14 @@ enum Command {
 //--------------------------------------------------------------
 // Функция для индикации с помощью светодиода
 //--------------------------------------------------------------
-void indicateLed(int blinkCount, int pauseOnOff, int pauseTime) {
+void indicateLed(int blinkCount, int onTime, int offTime, int pauseTime=0) {
     pinMode(STATE_LED, OUTPUT); // Настраиваем пин светодиода как выход
 
     for (int i = 0; i < blinkCount; i++) {
         digitalWrite(STATE_LED, HIGH); // Включаем светодиод
-        delay(pauseOnOff);                 // Ждем указанное время
+        delay(onTime);                 // Ждем указанное время
         digitalWrite(STATE_LED, LOW);  // Выключаем светодиод
-        delay(pauseOnOff);                // Ждем указанное время
+        delay(offTime);                // Ждем указанное время
     }
 
     delay(pauseTime); // Пауза между циклами
@@ -220,7 +220,7 @@ bool initModem() {
     DEBUG_PRINTLN("Ожидание готовности модема...");
 
     while (!gsmSerial.find("PBREADY")) {  // Ждём сообщение "+PBREADY"
-        indicateLed(1, 500, 500); // мигаем с частотой 0.5 сек
+        indicateLed(1, 500, 400); // мигаем с частотой 0.5 сек
     }
 
     // DEBUG_PRINTLN("Модем готов!");
@@ -249,7 +249,7 @@ bool initModem() {
 
     // Ждём сообщение "RDY" или "SMS Ready" от модема
     while (!gsmSerial.find("RDY") && !gsmSerial.find("Ready")) {
-        indicateLed(1, 500, 500); // мигаем с частотой 0.5 сек
+        indicateLed(1, 500, 400); // мигаем с частотой 0.5 сек
     }
 
     DEBUG_PRINTLN("Модем готов!");
@@ -361,6 +361,7 @@ void switchPower(bool newState) {
   if (saveState) {
     EEPROM.update(STATE_ADDR, newState);
   }
+  if (!state) timer = 0;
   // DEBUG_PRINTLN("\nPOWER: " + String(state ? "ON" : "OFF"));  // Сообщаем, что получили подтверждение
 }
 
@@ -383,7 +384,7 @@ bool currentTemper(float &temperature) {
 //--------------------------------------------------------------
 #ifdef USE_TIMER
 void timerControl() {
-    if (timer == 0 || millis() >= timer) {
+    if (millis() >= timer) {
         switchPower(false);
         timer = 0;
     }
@@ -425,7 +426,7 @@ void setup() {
       EEPROM.write(i, 0);
     }
     // DEBUG_PRINTLN(F("EEPROM очищена"));
-    indicateLed(5,150,0);
+    indicateLed(5, 150, 150);
   }
 
   bool initFlag = false;              // Флаг удачной инициализации модема
@@ -443,7 +444,7 @@ void setup() {
     #endif
     delay(5000); // Ждем 5 секунд перед повторной попыткой
   }
-  if (!initFlag) while(1) indicateLed(2, 200, 1000); // Если ошибка инициализации - 2 мигания с паузой 0.2 сек, затем пауза 1 сек
+  if (!initFlag) while(1) indicateLed(2, 200, 200, 1000); // Если ошибка инициализации - 2 мигания по 0.2 сек, с паузой в 1 сек
 
   saveState = EEPROM.read(SS_ADDR);
   if(saveState) {
@@ -590,24 +591,21 @@ String extractNumber(String& val) {
 }
 
 void incoming_call_sms() {
-    val = "";  // Очищаем перед приёмом
-    byte ch = 0;
-    unsigned long startTime = millis();  // Засекаем время начала чтения
+    val = gsmSerial.readString(); // Чтение ответа модема
 
-    // Ждём прихода данных в буфер (до 3 секунд)
-    while (!gsmSerial.available() && millis() - startTime < 3000);
-
-    // Читаем данные
-    startTime = millis();  // Перезапускаем таймер
-    while (millis() - startTime < 1000) { // Читаем данные 1 секунду
-        while (gsmSerial.available()) {
-            ch = gsmSerial.read();
-            val += char(ch);
-            startTime = millis();  // Сброс таймера при поступлении данных
-        }
-    }
     // DEBUG_PRINT("Получено: ");  // Отладка
     // DEBUG_PRINTLN(val);  // Отладка
+
+    // Поиск "+CMT" во входящем сообщении
+    int cmtIndex = val.indexOf("+CMT");
+    if (cmtIndex != -1) { // Если "+CMT" найден
+      // Извлечение текста после "+CMT"
+      String smsText = val.substring(cmtIndex);
+      DEBUG_PRINT("Текст SMS: ");
+      DEBUG_PRINTLN(smsText);
+      val = smsText;
+    }
+    else val = "";
 
     Command cmd = getCommand(val);
     // DEBUG_PRINTLN("Команда: " + String(cmd));  // Должно вывести CMD_...
@@ -619,7 +617,13 @@ void incoming_call_sms() {
               if (currentTemper(temperature)) { // Измеряем температуру
                 temp = String(temperature) + "'C";
               } else temp = "ERROR";
+              String tmr = "";
+              if (timer != 0) {
+                tmr = "TIMER: " + String((timer-millis())/60000) + " MIN LEFT BEFORE OFF";
+              }
+              else tmr = "TIMER: OFF";
               sendSMS("POWER: " + String(state ? "ON" : "OFF") + LINE_BREAK +
+                      tmr + LINE_BREAK +
                       "TEMP: " + temp + LINE_BREAK +
                       "SAVE STATE POWER: " + String(saveState ? "ON" : "OFF") + LINE_BREAK +
                       "REPLY SMS: " + String(replySMS ? "ON" : "OFF") + LINE_BREAK +
@@ -690,7 +694,7 @@ void incoming_call_sms() {
                 if (extractedTime > 0) {
                     timer = extractedTime * 60000 + millis(); // Минуты в миллисекунды
                     switchPower(true);
-                    sendSMS("TIMER: " + String(extractedTime) + " MIN", NUMBER_TO_SEND);
+                    sendSMS("TIMER ON: " + String(extractedTime) + " MIN", NUMBER_TO_SEND);
                 } else {
                     sendSMS("TIMER: OFF", NUMBER_TO_SEND);
                 }
