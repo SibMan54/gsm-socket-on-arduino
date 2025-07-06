@@ -11,6 +11,7 @@
 #define EB_NO_BUFFER        // отключить буферизацию энкодера (экономит 1 байт оперативки)
 #include <EncButton.h>
 #include <GyverDS18.h>
+#include <GyverTimers.h>
 // #include <SoftwareSerial.h>
 #include <AltSoftSerial.h>
 
@@ -51,6 +52,7 @@ GyverDS18Single ds(DS_PIN);         // Создание объекта GyverDS18
 String oneNum = "79123456789";          // Основной мастер-номер
 String twoNum = "79123456789";          // Второй мастер-номер
 String val = "";
+bool senderNumber = false;              // 0 = oneNum 1 = twoNum
 bool state = false;                     // Текущее состояние нагрузки
 bool saveState = false;                 // Переменная вкл/выкл сщхранения статуса нагрузки
 bool replySMS = false;                  // Переменная вкл/выкл ответных СМС на звонок
@@ -62,6 +64,7 @@ uint32_t timer = 0;                     // Таймер работы нагру�
 int8_t heaterVal = 1;                   // Состояние самоподогрева
 #endif
 volatile bool ringFlag = false;         // Флаг прерывания при поступлении смс или звонка
+volatile uint8_t minuteCounter = 0;  // Счётчик секунд
 
 //---------АДРЕСА В EEPROM--------------
 #define STATE_ADDR 1
@@ -135,9 +138,63 @@ bool sendAtCmd(String at_send, String ok_answer = "OK", uint16_t wait_sec = 2) {
 //--------------------------------------------------------------
 // Инициализация GSM модема
 //--------------------------------------------------------------
+void initModem() {
+    gsmSerial.begin(9600);
+    delay(2000);
+
+#ifdef USE_M590
+    DEBUG_PRINTLN("Ожидание готовности модема...");
+
+    while (!gsmSerial.find("PBREADY")) {  // Ждём сообщение "+PBREADY"
+        indicateLed(1, 500, 400); // мигаем с частотой 0.5 сек
+    }
+
+    // DEBUG_PRINTLN("Модем готов!");
+
+    // Настройка модема
+    if (sendAtCmd("AT")) DEBUG_PRINTLN("Модем отвечает"); // Проверка связи с модемом
+    else if (sendAtCmd("AT+IPR=9600")) DEBUG_PRINTLN("Скорость 9600 задана"); delay(1000);  // команда модему на установку скорости
+    if (sendAtCmd("AT+CLIP=1")) DEBUG_PRINTLN("АОН включен");                               // включаем АОН
+    if (sendAtCmd("AT+CMGF=1")) DEBUG_PRINTLN("Режим SMS установлен");                      // режим кодировки СМС - обычный (для англ.)
+    if (sendAtCmd("AT+CSCS=\"GSM\"")) DEBUG_PRINTLN("Кодировка текста установлена");        // режим кодировки текста
+    if (sendAtCmd("AT+CNMI=2,2")) DEBUG_PRINTLN("Настройки отображения SMS установлены");   // отображение смс в терминале сразу после приема (без этого сообщения молча падают в память)
+    if (sendAtCmd("AT&W")) DEBUG_PRINTLN("Настройки сохранены");                            // сохранение настроек в энергонезависимой памяти
+    delay(500);
+
+    // Очистка памяти SMS
+    if (sendAtCmd("AT+CMGD=1,4")) DEBUG_PRINTLN("Память модема очищена"); // Удаление всех SMS
+
+    DEBUG_PRINTLN("\nМодем инициализирован");
+#endif
+
+#ifdef USE_SIM800
+    DEBUG_PRINTLN("Ожидание готовности модема...");
+
+    // Ждём сообщение "RDY" или "SMS Ready" от модема
+    while (!gsmSerial.find("RDY") && !gsmSerial.find("Ready")) {
+        indicateLed(1, 500, 400); // мигаем с частотой 0.5 сек
+    }
+
+    DEBUG_PRINTLN("Модем готов!");
+
+    // Настройка модема
+    if (sendAtCmd("AT")) DEBUG_PRINTLN("Модем отвечает"); // Проверка связи с модемом
+    else if (sendAtCmd("AT+IPR=9600")) DEBUG_PRINTLN("Скорость 9600 задана"); delay(1000);      // команда модему на установку скорости
+    if (sendAtCmd("AT+CMGF=1")) DEBUG_PRINTLN("Режим SMS установлен");                           // режим кодировки СМС - обычный (для англ.)
+    if (sendAtCmd("AT+CNMI=1,2,0,0,0")) DEBUG_PRINTLN("Настройки отображения SMS установлены"); // Настройка приема SMS
+    if (sendAtCmd("AT+CSMP=17,167,0,0")) DEBUG_PRINTLN("Кодировка текста установлена");         // Настройка кодировки SMS
+    delay(200);
+
+    DEBUG_PRINTLN("\nМодем инициализирован");
+#endif
+}
+
+//--------------------------------------------------------------
+// Проверка сети
+//--------------------------------------------------------------
 bool checkNetwork() {
     String response; // Переменная для хранения ответа модема
-    int attempts = 5; // Количество попыток проверки регистрации
+    int attempts = 6; // Количество попыток проверки регистрации
     bool registered = false; // Флаг успешной регистрации
 
     // Проверка регистрации в сети с несколькими попытками
@@ -168,7 +225,7 @@ bool checkNetwork() {
         }
 
         // DEBUG_PRINTLN("Модем не зарегистрирован в сети, повторная попытка...");
-        delay(1000); // Задержка перед следующей попыткой
+        delay(2000); // Задержка перед следующей попыткой
     }
 
     // Если регистрация не удалась
@@ -203,67 +260,13 @@ bool checkNetwork() {
     DEBUG_PRINTLN(csq);
 
     // Проверка уровня сигнала (для SIM800 допустимые значения 0-31, где 99 - ошибка)
-    if (csq == 99 || csq < 10) {
+    if (csq == 99 || csq < 5) {
         DEBUG_PRINTLN("Ошибка: слабый сигнал или нет сети!");
         return false;
     }
 
     DEBUG_PRINTLN("Уровень сигнала в норме");
     return true;
-}
-
-bool initModem() {
-    gsmSerial.begin(9600);
-    delay(2000);
-
-#ifdef USE_M590
-    DEBUG_PRINTLN("Ожидание готовности модема...");
-
-    while (!gsmSerial.find("PBREADY")) {  // Ждём сообщение "+PBREADY"
-        indicateLed(1, 500, 400); // мигаем с частотой 0.5 сек
-    }
-
-    // DEBUG_PRINTLN("Модем готов!");
-
-    // Настройка модема
-    if (sendAtCmd("AT")) DEBUG_PRINTLN("Модем отвечает"); // Проверка связи с модемом
-    else if (sendAtCmd("AT+IPR=9600")) DEBUG_PRINTLN("Скорость 9600 задана"); delay(1000);  // команда модему на установку скорости
-    if (sendAtCmd("AT+CLIP=1")) DEBUG_PRINTLN("АОН включен");                               // включаем АОН
-    if (sendAtCmd("AT+CMGF=1")) DEBUG_PRINTLN("Режим SMS установлен");                      // режим кодировки СМС - обычный (для англ.)
-    if (sendAtCmd("AT+CSCS=\"GSM\"")) DEBUG_PRINTLN("Кодировка текста установлена");        // режим кодировки текста
-    if (sendAtCmd("AT+CNMI=2,2")) DEBUG_PRINTLN("Настройки отображения SMS установлены");   // отображение смс в терминале сразу после приема (без этого сообщения молча падают в память)
-    if (sendAtCmd("AT&W")) DEBUG_PRINTLN("Настройки сохранены");                            // сохранение настроек в энергонезависимой памяти
-    delay(500);
-
-    if (!checkNetwork()) return false;        // Проверка регистрации в сети и уровня сигнала
-
-    // Очистка памяти SMS
-    if (sendAtCmd("AT+CMGD=1,4")) DEBUG_PRINTLN("Память модема очищена"); // Удаление всех SMS
-
-    DEBUG_PRINTLN("\nМодем успешно инициализирован");
-    return true;
-#endif
-
-#ifdef USE_SIM800
-    DEBUG_PRINTLN("Ожидание готовности модема...");
-
-    // Ждём сообщение "RDY" или "SMS Ready" от модема
-    while (!gsmSerial.find("RDY") && !gsmSerial.find("Ready")) {
-        indicateLed(1, 500, 400); // мигаем с частотой 0.5 сек
-    }
-
-    DEBUG_PRINTLN("Модем готов!");
-
-    // Настройка модема
-    if (sendAtCmd("AT")) DEBUG_PRINTLN("Модем отвечает"); // Проверка связи с модемом
-    else if (sendAtCmd("AT+IPR=9600")) DEBUG_PRINTLN("Скорость 9600 задана"); delay(1000);      // команда модему на установку скорости
-    if (sendAtCmd("AT+CMGF=1")) DEBUG_PRINTLN("Режим SMS установлен");                           // режим кодировки СМС - обычный (для англ.)
-    if (sendAtCmd("AT+CNMI=1,2,0,0,0")) DEBUG_PRINTLN("Настройки отображения SMS установлены"); // Настройка приема SMS
-    if (sendAtCmd("AT+CSMP=17,167,0,0")) DEBUG_PRINTLN("Кодировка текста установлена");         // Настройка кодировки SMS
-
-    if (!checkNetwork()) return false;        // Проверка регистрации в сети и уровня сигнала
-
-#endif
 }
 
 //--------------------------------------------------------------
@@ -387,6 +390,7 @@ void timerControl() {
     if (millis() >= timer) {
         switchPower(false);
         timer = 0;
+        sendSMS("POWER: " + String(state ? "ON" : "OFF"), senderNumber  ? twoNum : oneNum);
     }
 }
 #endif
@@ -429,22 +433,7 @@ void setup() {
     indicateLed(5, 150, 150);
   }
 
-  bool initFlag = false;              // Флаг удачной инициализации модема
-  int attempts = 3;                   // Количество попыток инициализации модема
-  while (attempts-- > 0) {
-    if (initModem()) {                // Инициализация модема
-        initFlag = true;
-        break;
-    }
-    #ifdef USE_M590
-      if(sendAtCmd("AT+CRESET")) //DEBUG_PRINTLN("Модем перезагружен");
-    #endif
-    #ifdef USE_SIM800
-      if(sendAtCmd("AT+CFUN=1,1")) //DEBUG_PRINTLN("Модем перезагружен");
-    #endif
-    delay(5000); // Ждем 5 секунд перед повторной попыткой
-  }
-  if (!initFlag) while(1) indicateLed(2, 200, 200, 1000); // Если ошибка инициализации - 2 мигания по 0.2 сек, с паузой в 1 сек
+  initModem();              // Инициализируем модем
 
   saveState = EEPROM.read(SS_ADDR);
   if(saveState) {
@@ -479,6 +468,15 @@ void loop() {
   if(ringFlag) {
     ringFlag = false;               // Сбрасываем флаг
     incoming_call_sms();            // Запускаем функцию обработки смс ил звонка
+  }
+
+  // Переодическая проверка сети
+  static uint32_t lastTime = 0;  // static сохраняет значение между вызовами
+  if (millis() - lastTime >= 60000) {
+    lastTime = millis();
+    indicateLed(3, 150, 200, 500);                          // 3 мигания по 0.15 сек, с паузой в 0.5 сек
+    if (!checkNetwork()) digitalWrite(STATE_LED, HIGH);     // При неполадках с сетью вкл. светодиод
+    else digitalWrite(STATE_LED, LOW);
   }
 
   #ifdef USE_TIMER
@@ -605,7 +603,6 @@ void incoming_call_sms() {
       DEBUG_PRINTLN(smsText);
       val = smsText;
     }
-    else val = "";
 
     Command cmd = getCommand(val);
     // DEBUG_PRINTLN("Команда: " + String(cmd));  // Должно вывести CMD_...
@@ -695,6 +692,7 @@ void incoming_call_sms() {
                     timer = extractedTime * 60000 + millis(); // Минуты в миллисекунды
                     switchPower(true);
                     sendSMS("TIMER ON: " + String(extractedTime) + " MIN", NUMBER_TO_SEND);
+                    senderNumber = (val.indexOf(oneNum) > -1) ? false : true;
                 } else {
                     sendSMS("TIMER: OFF", NUMBER_TO_SEND);
                 }
